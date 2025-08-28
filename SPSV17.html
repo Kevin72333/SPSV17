@@ -18,6 +18,17 @@
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Noto+Sans+TC:wght@400;700&family=Montserrat:wght@400;700&display=swap" rel="stylesheet">
     
     <!-- 非同步載入外部資源 -->
+    <!-- 建立全域 state 以供非模組程式或第三方回呼存取 -->
+    <script>
+        // 建立真正的全域 state（使用 var 以讓非嚴格模式與第三方程式能存取）
+        if (!window.state) window.state = {};
+        try {
+            if (typeof state === 'undefined') { var state = window.state; }
+        } catch (e) {
+            window.state = window.state || {};
+            var state = window.state;
+        }
+    </script>
     <script src="https://cdn.tailwindcss.com" defer></script>
     <script src="https://cdn.jsdelivr.net/npm/xlsx-populate@1.21.0/browser/xlsx-populate.min.js" defer></script>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2" defer></script>
@@ -36,7 +47,7 @@
     // 讓其他 module script 可安全存取（避免跨模組作用域問題）
     window.SUPABASE_ANON_KEY = supabaseAnonKey;
 
-        // 等待依賴載入完成
+    // 等待依賴載入完成
         const waitForDependencies = () => {
             return new Promise((resolve) => {
                 const checkDependencies = () => {
@@ -48,6 +59,72 @@
                 };
                 checkDependencies();
             });
+        };
+
+    // --- 全域狀態管理 ---
+    // 指派到已存在的全域 state（避免 module scope 與全域 scope 不一致）
+    state = {
+            theme: 'default',
+            view: 'login',
+            requests: [],
+            products: {}, // 分類後的產品
+            allProducts: [], // 所有產品列表
+            vendors: [], // 廠商列表
+            users: {}, // key 是 user uuid
+            categories: [],
+            departments: {},
+            applicantNotifications: [],
+            currentUser: null, // 包含從 users 表來的 profile
+            selectedRequest: null,
+            editingRequest: null, // *** NEW: 正在編輯的草稿 ***
+            editingProduct: null,
+            editingUser: null,
+            editingVendor: null,
+            loading: true,
+            error: null,
+            local: {
+                dashboardFilters: {
+                    vendors: new Set(),
+                    statuses: new Set(),
+                    handlerStatuses: new Set(),
+                    closedStatuses: new Set(),
+                },
+                personalForms: {
+                    activeTab: 'inbox',
+                    inbox: { searchTerm: '' },
+                    sent: { status: 'all', searchTerm: '', dateFrom: '', dateTo: '' },
+                    history: { status: 'all', searchTerm: '', dateFrom: '', dateTo: '' },
+                    handler: { status: 'all', handlerStatus: 'all', searchTerm: '', dateFrom: '', dateTo: '' },
+                    closed: { status: 'all', searchTerm: '', dateFrom: '', dateTo: '' },
+                },
+                userManagementFilters: {
+                    department: 'all',
+                    searchTerm: ''
+                },
+                departmentManagementSearchTerm: '',
+                vendorManagementSearchTerm: '',
+                newRequestCart: [],
+                activeProductCategory: '我的最愛',
+                activeProductManagementCategory: '全品項',
+                selectedRequestIds: new Set(),
+                currentPage: 1,
+                itemsPerPage: 10,
+                permissionFilter: 'my',
+                consolidatedData: null,
+                sortKey: 'request_date',
+                sortDirection: 'desc',
+                productManagementSearchTerm: '',
+                newRequestSearchTerm: '',
+                newRequestSearchAll: false,
+                newRequestCurrentPage: 1,
+                productSortKey: 'id',
+                productSortDirection: 'asc',
+                productFilters: {},
+                favoriteProductIds: new Set(),
+                layoutScale: 'expanded', // 'expanded' = 3:2 (+), 'compact' = 2:3 (-)
+                // 申請單附件（在送出/儲存前的本地暫存）
+                newRequestAttachments: []
+            }
         };
 
         // 初始化 Supabase（延遲載入）
@@ -344,6 +421,1246 @@
         };
 
         window.CacheManager = CacheManager;
+
+        // === LocalStorage 管理與自動登入功能（適用於Google Sites）===
+        
+        // Google Sites 會話管理器 - 完全依賴伺服器端
+        class GoogleSitesSessionManager {
+            constructor() {
+                this.sessionKey = 'current_session';
+                this.isGoogleSites = this.detectGoogleSites();
+                this.deviceId = this.generateDeviceId();
+                console.log(`🔧 Google Sites 會話管理器初始化: ${this.isGoogleSites ? '已啟用' : '未啟用'}`);
+                console.log(`📱 設備ID: ${this.deviceId}`);
+            }
+
+            detectGoogleSites() {
+                // 臨時強制啟用 Google Sites 模式用於測試
+                const forceGoogleSites = true; // 設為 true 來測試
+                
+                const realDetection = window.location.hostname.includes('sites.google.com') || 
+                                    document.referrer.includes('sites.google.com') ||
+                                    window.parent !== window; // 在 iframe 中
+                
+                const result = forceGoogleSites || realDetection;
+                console.log(`🔍 [GoogleSitesSessionManager] Google Sites 檢測: force=${forceGoogleSites}, real=${realDetection}, result=${result}`);
+                return result;
+            }
+
+            // 生成設備指紋作為唯一識別
+            generateDeviceId() {
+                // 首先嘗試從 localStorage 讀取已存在的設備ID
+                let storedDeviceId = localStorage.getItem('device_fingerprint_id');
+                
+                // 如果 localStorage 被清除了，嘗試從 sessionStorage 讀取
+                if (!storedDeviceId) {
+                    storedDeviceId = sessionStorage.getItem('device_fingerprint_id');
+                    if (storedDeviceId) {
+                        // 如果在 sessionStorage 中找到了，重新保存到 localStorage
+                        try {
+                            localStorage.setItem('device_fingerprint_id', storedDeviceId);
+                            console.log(`🔄 [設備指紋] 從 sessionStorage 恢復設備ID: ${storedDeviceId}`);
+                        } catch (error) {
+                            console.warn(`⚠️ [設備指紋] 無法保存到 localStorage:`, error);
+                        }
+                    }
+                }
+                
+                if (storedDeviceId) {
+                    console.log(`🔍 [設備指紋] 使用已存儲的設備ID: ${storedDeviceId}`);
+                    return storedDeviceId;
+                }
+
+                // 如果沒有存儲的ID，使用更穩定的指紋要素
+                const fingerprint = [
+                    navigator.userAgent,
+                    navigator.language,
+                    screen.width + 'x' + screen.height + 'x' + screen.colorDepth,
+                    new Date().getTimezoneOffset(),
+                    navigator.platform,
+                    navigator.hardwareConcurrency || 'unknown',
+                    // 移除所有動態屬性
+                ].filter(Boolean).join('|');
+                
+                console.log(`🔍 [設備指紋] 原始數據: ${fingerprint.substring(0, 100)}...`);
+                
+                // 生成簡短的設備ID
+                let hash = 0;
+                for (let i = 0; i < fingerprint.length; i++) {
+                    const char = fingerprint.charCodeAt(i);
+                    hash = ((hash << 5) - hash) + char;
+                    hash = hash & hash; // 轉換為32位整數
+                }
+                
+                const deviceId = Math.abs(hash).toString(36);
+                console.log(`🔍 [設備指紋] 生成的設備ID: ${deviceId}`);
+                
+                // 將設備ID存儲到 localStorage 和 sessionStorage 以保持穩定性
+                try {
+                    localStorage.setItem('device_fingerprint_id', deviceId);
+                    sessionStorage.setItem('device_fingerprint_id', deviceId);
+                    console.log(`✅ [設備指紋] 設備ID已保存到 localStorage 和 sessionStorage`);
+                } catch (error) {
+                    console.warn(`⚠️ [設備指紋] 無法保存設備ID:`, error);
+                }
+                
+                return deviceId;
+            }
+
+            // 生成自動登入令牌
+            generateAutoLoginToken() {
+                const array = new Uint8Array(32);
+                window.crypto.getRandomValues(array);
+                return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+            }
+
+            // 保存登入會話（完全依賴資料庫）
+            async saveLoginSession(userId, rememberLogin = false) {
+                console.log(`🔄 [Google Sites] 開始保存會話: 使用者=${userId}, 記住登入=${rememberLogin}, 設備=${this.deviceId}`);
+                
+                if (!rememberLogin) {
+                    console.log('❌ 未勾選記住登入，跳過會話保存');
+                    return false;
+                }
+
+                try {
+                    // 生成自動登入令牌
+                    const autoLoginToken = this.generateAutoLoginToken();
+                    const expiryDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30天後過期
+
+                    // 清除該設備的舊會話
+                    console.log('🧹 [Google Sites] 清除舊會話...');
+                    await supabase
+                        .from('login_sessions')
+                        .delete()
+                        .eq('device_id', this.deviceId);
+
+                    // 也清除該使用者的其他會話（避免唯一約束問題）
+                    console.log('🧹 [Google Sites] 清除使用者的其他會話...');
+                    await supabase
+                        .from('login_sessions')
+                        .delete()
+                        .eq('user_id', userId);
+
+                    // 創建新的會話記錄
+                    console.log('📝 [Google Sites] 嘗試插入會話記錄...');
+                    const sessionData = {
+                        user_id: userId,
+                        auto_login_token: autoLoginToken,
+                        device_id: this.deviceId,
+                        expires_at: expiryDate.toISOString(),
+                        is_active: true,
+                        created_at: new Date().toISOString()
+                    };
+                    
+                    console.log('📊 [Google Sites] 插入的會話資料:', {
+                        user_id: sessionData.user_id,
+                        token_preview: autoLoginToken.substring(0, 16) + '...',
+                        device_id: sessionData.device_id,
+                        expires_at: sessionData.expires_at,
+                        is_active: sessionData.is_active,
+                        created_at: sessionData.created_at
+                    });
+                    
+                    const { data, error } = await supabase
+                        .from('login_sessions')
+                        .insert([sessionData])
+                        .select(); // 返回插入的記錄
+
+                    if (error) {
+                        console.error('❌ 保存會話到資料庫失敗:', error);
+                        console.error('錯誤詳情:', error.message);
+                        if (error.message.includes('device_id')) {
+                            console.error('⚠️ 請在 Supabase SQL 編輯器中執行: ALTER TABLE login_sessions ADD COLUMN device_id text;');
+                        }
+                        return false;
+                    }
+
+                    console.log('✅ [Google Sites] 會話已保存到資料庫');
+                    console.log('📋 [Google Sites] 插入成功的記錄:', data);
+                    console.log(`🔐 令牌: ${autoLoginToken.substring(0, 16)}...`);
+                    console.log(`📱 設備: ${this.deviceId}`);
+                    console.log(`⏰ 過期時間: ${expiryDate.toLocaleString('zh-TW')}`);
+                    
+                    // 立即驗證插入是否成功
+                    console.log('🔍 [驗證] 立即查詢剛插入的記錄...');
+                    const verifyResult = await supabase
+                        .from('login_sessions')
+                        .select('*')
+                        .eq('device_id', this.deviceId)
+                        .eq('auto_login_token', autoLoginToken)
+                        .single();
+                    
+                    if (verifyResult.error) {
+                        console.error('❌ [驗證] 查詢剛插入的記錄失敗:', verifyResult.error);
+                    } else {
+                        console.log('✅ [驗證] 找到剛插入的記錄:', verifyResult.data);
+                    }
+                    console.log(`📱 設備: ${this.deviceId}`);
+                    console.log(`⏰ 過期時間: ${expiryDate.toLocaleString()}`);
+                    
+                    return true;
+                } catch (error) {
+                    console.error('❌ 保存會話時發生錯誤:', error);
+                    return false;
+                }
+            }
+
+            // 檢查自動登入（完全依賴資料庫）
+            async checkAutoLogin() {
+                console.log(`🔍 [Google Sites] 開始檢查自動登入: 設備=${this.deviceId}`);
+
+                try {
+                    // 先檢查 Supabase 客戶端狀態
+                    console.log('🔧 [調試] Supabase 客戶端狀態:');
+                    console.log('  - supabase 對象:', typeof supabase);
+                    console.log('  - supabase.auth:', typeof supabase?.auth);
+                    console.log('  - supabase.from:', typeof supabase?.from);
+                    console.log('  - supabase.supabaseUrl:', supabase?.supabaseUrl);
+                    console.log('  - supabase.supabaseKey:', supabase?.supabaseKey?.substring(0, 20) + '...');
+                    
+                    // 在 Google Sites 環境中跳過 Supabase auth 檢查，因為可能會卡住
+                    console.log('🌐 [Google Sites] 跳過 Supabase auth 檢查，直接查詢會話記錄');
+                    console.log('� [說明] Google Sites 環境中 Supabase auth API 可能被阻止，使用資料庫查詢代替');
+                    
+                    // 直接查詢會話記錄，不檢查認證狀態
+                    
+                    const currentTime = new Date().toISOString();
+                    const currentTimeLocal = new Date().toLocaleString('zh-TW');
+                    console.log(`🔍 [Google Sites] 查詢條件:`);
+                    console.log(`  - device_id: "${this.deviceId}"`);
+                    console.log(`  - is_active: true`);
+                    console.log(`  - expires_at > "${currentTime}"`);
+                    console.log(`  - 當前時間: ${currentTimeLocal}`);
+                    
+                    // 嘗試創建一個臨時的 service client 來繞過 RLS
+                    console.log('🔧 [繞過RLS] 嘗試使用 service role 查詢...');
+                    
+                    // 使用 rpc 調用來繞過 RLS 限制
+                    const { data: sessions, error } = await supabase.rpc('get_login_session_by_device', {
+                        p_device_id: this.deviceId,
+                        p_current_time: currentTime
+                    });
+
+                    if (error) {
+                        console.error('❌ [RPC] RPC 調用失敗，嘗試普通查詢:', error);
+                        
+                        // 如果 RPC 失敗，回到普通查詢
+                        const fallbackQuery = await supabase
+                            .from('login_sessions')
+                            .select('*')
+                            .eq('device_id', this.deviceId)
+                            .eq('is_active', true)
+                            .order('created_at', { ascending: false })
+                            .limit(5);
+                        
+                        console.log(`� [Google Sites] 普通查詢結果:`, fallbackQuery.data);
+                        console.log(`📊 [Google Sites] 找到 ${fallbackQuery.data?.length || 0} 個會話記錄`);
+                        
+                        if (!fallbackQuery.data || fallbackQuery.data.length === 0) {
+                            console.log('❌ 沒有找到有效的會話記錄');
+
+                            // 嘗試 localStorage 回退（加速 UI 恢復，避免卡住載入畫面）
+                            try {
+                                const cacheRaw = localStorage.getItem('sps_autologin_cache');
+                                if (cacheRaw) {
+                                    const cache = JSON.parse(cacheRaw);
+                                    const now = Date.now();
+                                    if (cache.expiresAt && new Date(cache.expiresAt).getTime() > now) {
+                                        console.log('🔁 [快取回退] 使用 localStorage 的自動登入快取，立即恢復 UI');
+                                        // 設定 window.currentUser 與 state.currentUser
+                                        window.currentUser = cache.userInfo;
+                                        if (state) {
+                                            state.currentUser = cache.userInfo;
+                                            state.loading = false;
+                                            state.view = 'dashboard';
+                                        }
+                                        // 立即渲染 UI
+                                        if (typeof render === 'function') render();
+
+                                        // 在背景驗證 token 是否仍有效（非阻塞）
+                                        (async () => {
+                                            try {
+                                                console.log('🔍 [快取回退] 背景驗證快取的自動登入 token');
+                                                const valid = await this.performAutoLogin(cache.userInfo.id || cache.userInfo.user_id, cache.token);
+                                                if (!valid) {
+                                                    console.log('⚠️ [快取回退] 背景驗證失敗：清除 localStorage 快取');
+                                                    localStorage.removeItem('sps_autologin_cache');
+                                                    // 若驗證失敗，切回登入頁面
+                                                    updateState({ view: 'login', loading: false });
+                                                } else {
+                                                    console.log('✅ [快取回退] 背景驗證成功');
+                                                }
+                                            } catch (e) {
+                                                console.warn('⚠️ [快取回退] 背景驗證過程出錯:', e);
+                                            }
+                                        })();
+
+                                        return cache.userInfo.user_id || cache.userInfo.id;
+                                    } else {
+                                        console.log('🔒 [快取回退] localStorage 快取不存在或已過期');
+                                    }
+                                }
+                            } catch (e) {
+                                console.warn('⚠️ 讀取 localStorage 自動登入快取發生錯誤:', e);
+                            }
+
+                            return null;
+                        }
+
+                        const session = fallbackQuery.data[0];
+                        return await this.performAutoLogin(session.user_id, session.auto_login_token);
+                    }
+
+                    console.log(`📋 [RPC] RPC 查詢結果:`, sessions);
+                    console.log(`📊 [RPC] 找到 ${sessions?.length || 0} 個會話記錄`);
+
+                    if (!sessions || sessions.length === 0) {
+                        console.log('❌ RPC 查詢：沒有找到有效的會話記錄');
+                        return null;
+                    }
+
+                    const session = sessions[0];
+                    console.log('✅ [RPC] 找到有效會話:', {
+                        userId: session.user_id,
+                        expires: new Date(session.expires_at).toLocaleString()
+                    });
+
+                    // 嘗試使用令牌自動登入
+                    const loginResult = await this.performAutoLogin(session.user_id, session.auto_login_token);
+                    
+                    if (loginResult) {
+                        console.log('🎉 自動登入成功!');
+                        return session.user_id;
+                    } else {
+                        console.log('❌ 自動登入失敗，清除無效會話');
+                        await this.clearInvalidSession(session.auto_login_token);
+                        return null;
+                    }
+
+                } catch (error) {
+                    console.error('❌ [Google Sites] 檢查自動登入時發生錯誤:', error);
+                    return null;
+                }
+            }
+
+            // 執行自動登入
+            async performAutoLogin(userId, token) {
+                try {
+                    console.log(`🔐 [自動登入] 開始執行: 使用者=${userId.substring(0, 8)}..., 令牌=${token.substring(0, 16)}...`);
+                    
+                    // 直接驗證令牌是否有效（不依賴外部 users 表）
+                    const { data: sessionData, error: sessionError } = await supabase
+                        .from('login_sessions')
+                        .select('user_id, auto_login_token, expires_at')
+                        .eq('auto_login_token', token)
+                        .eq('user_id', userId)
+                        .eq('is_active', true)
+                        .gt('expires_at', new Date().toISOString())
+                        .single();
+
+                    if (sessionError || !sessionData) {
+                        console.log('❌ [自動登入] 令牌無效或已過期:', sessionError);
+                        return { success: false, error: '令牌無效或已過期' };
+                    }
+
+                    console.log('✅ [自動登入] 令牌驗證成功');
+                    
+                    // 設置使用者狀態（避免依賴外部表）
+                    const userInfo = {
+                        id: userId,
+                        user_id: userId,
+                        username: userId.substring(0, 8), // 臨時用戶名
+                        name: `使用者 ${userId.substring(0, 8)}`, // 臨時姓名
+                        role: '使用者', // 預設角色
+                        department: '未知部門',
+                        is_admin: false,
+                        loginMethod: 'auto_login',
+                        loginTime: new Date()
+                    };
+                    
+                    // 同時設置 window.currentUser 和 state.currentUser
+                    window.currentUser = userInfo;
+                    
+                    // 確保 state 物件存在並設置 currentUser
+                    if (typeof state !== 'undefined' && state) {
+                        state.currentUser = userInfo;
+                        console.log('✅ [自動登入] state.currentUser 已設置');
+                    } else {
+                        console.warn('⚠️ [自動登入] state 物件不存在，只設置 window.currentUser');
+                    }
+                    
+                    console.log('🎉 [自動登入] 使用者狀態已設置:', userInfo);
+                    
+                    // 更新狀態並渲染UI
+                    try {
+                        if (typeof state !== 'undefined' && state) {
+                            // 設置狀態：停止載入，切換到dashboard視圖
+                            state.loading = false;
+                            state.view = 'dashboard';
+                            state.error = null;
+                            console.log('✅ [自動登入] 狀態已更新: loading=false, view=dashboard');
+                        }
+                        
+                        // 調用渲染函數更新UI
+                        if (typeof render === 'function') {
+                            render();
+                            console.log('✅ [自動登入] UI已重新渲染');
+                        } else {
+                            console.warn('⚠️ [自動登入] render 函數不存在');
+                        }
+                    } catch (uiError) {
+                        console.log('⚠️ [自動登入] UI更新失敗，但登入成功:', uiError);
+                    }
+                    
+                    return { success: true, userId: userId };
+                } catch (error) {
+                    console.error('❌ [自動登入] 執行失敗:', error);
+                    return { success: false, error: error.message };
+                }
+            }
+
+            // 清除無效會話
+            async clearInvalidSession(token) {
+                try {
+                    await supabase
+                        .from('login_sessions')
+                        .delete()
+                        .eq('auto_login_token', token);
+                    console.log('🗑️ 已清除無效會話');
+                } catch (error) {
+                    console.error('❌ 清除無效會話失敗:', error);
+                }
+            }
+
+            // 清除登入會話
+            async clearLoginSession() {
+                console.log(`🧹 [Google Sites] 開始清除會話: 設備=${this.deviceId}`);
+                
+                try {
+                    // 清除該設備的所有會話
+                    const { error } = await supabase
+                        .from('login_sessions')
+                        .delete()
+                        .eq('device_id', this.deviceId);
+
+                    if (error) {
+                        console.error('❌ 清除會話失敗:', error);
+                        return false;
+                    }
+
+                    console.log('✅ [Google Sites] 會話已清除');
+                    return true;
+                } catch (error) {
+                    console.error('❌ 清除會話時發生錯誤:', error);
+                    return false;
+                }
+            }
+        }
+
+        // 建立 Google Sites 會話管理器實例
+        const googleSitesSession = new GoogleSitesSessionManager();
+        
+        // 確保資料庫 schema 包含 device_id 欄位
+        async function ensureDeviceIdColumn() {
+            try {
+                // 檢查 device_id 欄位是否存在，如果不存在則添加
+                const { data, error } = await supabase
+                    .from('login_sessions')
+                    .select('device_id')
+                    .limit(1);
+                
+                if (error && error.message.includes('column "device_id" does not exist')) {
+                    console.log('⚡ 添加 device_id 欄位到 login_sessions 資料表...');
+                    // 注意：在 Supabase 中，你需要在 SQL 編輯器中手動執行以下 SQL：
+                    // ALTER TABLE login_sessions ADD COLUMN device_id text;
+                    console.warn('⚠️ 請在 Supabase SQL 編輯器中執行: ALTER TABLE login_sessions ADD COLUMN device_id text;');
+                }
+            } catch (error) {
+                console.log('📋 device_id 欄位檢查完成');
+            }
+        }
+        
+        // 在頁面載入時檢查資料庫 schema
+        ensureDeviceIdColumn();
+        
+        // 超級持久化存儲方案（針對Google Sites優化）
+        class SuperPersistentStorage {
+            constructor() {
+                this.methods = ['indexedDB', 'localStorage', 'sessionStorage', 'urlParams', 'document'];
+                this.prefix = 'sps_';
+            }
+
+            // URL 參數儲存（最後手段）
+            saveToURL(key, value, days = 30) {
+                try {
+                    // 取得現有的 URL 資料
+                    let existingData = {};
+                    const currentHash = location.hash;
+                    if (currentHash.includes('data=')) {
+                        try {
+                            const dataMatch = currentHash.match(/data=([^&]*)/);
+                            if (dataMatch) {
+                                existingData = JSON.parse(atob(dataMatch[1]));
+                            }
+                        } catch (e) {
+                            console.warn('解析現有 URL 資料失敗，將創建新的');
+                        }
+                    }
+                    
+                    // 添加新資料
+                    const expires = new Date(Date.now() + days * 24 * 60 * 60 * 1000).getTime();
+                    existingData[key] = { value, expires };
+                    
+                    const urlData = btoa(JSON.stringify(existingData));
+                    
+                    // 更新 hash
+                    let newHash = currentHash;
+                    if (newHash.includes('data=')) {
+                        newHash = newHash.replace(/data=[^&]*/, `data=${urlData}`);
+                    } else {
+                        const separator = newHash.includes('?') ? '&' : (newHash === '#' ? '?' : '&');
+                        newHash = (newHash || '#') + separator + `data=${urlData}`;
+                    }
+                    
+                    // 靜默更新 URL
+                    if (history.replaceState) {
+                        history.replaceState(null, '', location.pathname + location.search + newHash);
+                        console.log('🔗 URL 參數儲存成功:', key);
+                        return true;
+                    }
+                } catch (error) {
+                    console.error('❌ URL 參數儲存失敗:', error);
+                }
+                return false;
+            }
+
+            // 從 URL 參數讀取
+            getFromURL(key) {
+                try {
+                    const hash = location.hash;
+                    console.log(`🔍 URL Hash: "${hash}"`);
+                    
+                    const dataMatch = hash.match(/data=([^&]*)/);
+                    if (!dataMatch) {
+                        console.log('❌ URL 中沒有找到 data 參數');
+                        return null;
+                    }
+                    
+                    console.log(`🔍 找到 data 參數:`, dataMatch[1].substring(0, 50) + '...');
+                    const urlData = JSON.parse(atob(dataMatch[1]));
+                    console.log(`🔍 解析後的 URL 資料:`, urlData);
+                    
+                    const item = urlData[key];
+                    if (!item) {
+                        console.log(`❌ URL 資料中沒有找到鍵: ${key}`);
+                        return null;
+                    }
+                    
+                    // 檢查過期
+                    if (item.expires && item.expires < Date.now()) {
+                        console.log('⏰ URL 參數資料已過期:', key);
+                        return null;
+                    }
+                    
+                    console.log('🔗 從 URL 參數恢復資料:', key);
+                    return item.value;
+                } catch (error) {
+                    console.error('❌ URL 參數讀取失敗:', error);
+                }
+                return null;
+            }
+
+            // Document title 隱藏儲存（極端備用）
+            saveToDocument(key, value) {
+                try {
+                    const originalTitle = document.title;
+                    
+                    // 檢查是否已有隱藏資料
+                    let existingData = {};
+                    const hiddenDataMatch = originalTitle.match(/\u200B(.+)$/);
+                    if (hiddenDataMatch) {
+                        try {
+                            existingData = JSON.parse(atob(hiddenDataMatch[1]));
+                        } catch (e) {
+                            console.warn('解析現有 Document 資料失敗，將創建新的');
+                        }
+                    }
+                    
+                    // 添加新資料
+                    existingData[key] = value;
+                    const hiddenData = btoa(JSON.stringify(existingData));
+                    
+                    // 移除舊的隱藏資料並添加新的
+                    const cleanTitle = originalTitle.replace(/\u200B.*$/, '');
+                    document.title = cleanTitle + '\u200B' + hiddenData; // 使用零寬字符
+                    console.log('📄 Document 隱藏儲存成功:', key);
+                    return true;
+                } catch (error) {
+                    console.error('❌ Document 儲存失敗:', error);
+                }
+                return false;
+            }
+
+            getFromDocument(key) {
+                try {
+                    const title = document.title;
+                    console.log(`🔍 Document 標題: "${title}"`);
+                    
+                    const hiddenDataMatch = title.match(/\u200B(.+)$/);
+                    if (!hiddenDataMatch) {
+                        console.log('❌ Document 標題中沒有找到隱藏資料');
+                        return null;
+                    }
+                    
+                    console.log(`🔍 找到隱藏資料:`, hiddenDataMatch[1].substring(0, 50) + '...');
+                    const hiddenData = JSON.parse(atob(hiddenDataMatch[1]));
+                    console.log(`🔍 解析後的 Document 資料:`, hiddenData);
+                    
+                    const value = hiddenData[key];
+                    if (value) {
+                        console.log('📄 從 Document 恢復資料:', key);
+                        return value;
+                    } else {
+                        console.log(`❌ Document 資料中沒有找到鍵: ${key}`);
+                    }
+                } catch (error) {
+                    console.error('❌ Document 讀取失敗:', error);
+                }
+                return null;
+            }
+
+            // 超級保存：同時使用所有可用方法
+            async superSave(key, value, days = 30) {
+                const results = [];
+                
+                console.log(`🚀 開始超級保存: ${key}`);
+                
+                // 方法1：原有的多重 LocalStorage
+                try {
+                    const success = await setLocalData(key, value, days);
+                    results.push({ method: 'localStorage', success });
+                } catch (error) {
+                    results.push({ method: 'localStorage', success: false, error });
+                }
+                
+                // 方法2：URL 參數
+                try {
+                    const success = this.saveToURL(key, value, days);
+                    results.push({ method: 'urlParams', success });
+                } catch (error) {
+                    results.push({ method: 'urlParams', success: false, error });
+                }
+                
+                // 方法3：Document 隱藏儲存
+                try {
+                    const success = this.saveToDocument(key, value);
+                    results.push({ method: 'document', success });
+                } catch (error) {
+                    results.push({ method: 'document', success: false, error });
+                }
+                
+                const successCount = results.filter(r => r.success).length;
+                console.log(`📊 超級保存結果: ${successCount}/${results.length} 方法成功`);
+                
+                // 詳細結果
+                results.forEach(result => {
+                    const status = result.success ? '✅' : '❌';
+                    console.log(`  ${status} ${result.method}: ${result.success ? '成功' : '失敗'}`);
+                });
+                
+                return successCount > 0;
+            }
+
+            // 超級讀取：從所有可能的地方恢復資料
+            async superGet(key) {
+                console.log(`🔍 開始超級讀取: ${key}`);
+                
+                // 方法1：原有的多重 LocalStorage + IndexedDB
+                try {
+                    const value = await getLocalData(key);
+                    if (value) {
+                        console.log(`✅ 從 LocalStorage/IndexedDB 恢復: ${key}`);
+                        return value;
+                    }
+                } catch (error) {
+                    console.error('LocalStorage/IndexedDB 讀取失敗:', error);
+                }
+                
+                // 方法2：URL 參數
+                try {
+                    console.log('🔍 檢查 URL 參數...', location.hash);
+                    const value = this.getFromURL(key);
+                    if (value) {
+                        console.log(`✅ 從 URL 參數恢復: ${key}`);
+                        // 恢復到 LocalStorage
+                        await setLocalData(key, value, 30);
+                        return value;
+                    }
+                } catch (error) {
+                    console.error('URL 參數讀取失敗:', error);
+                }
+                
+                // 方法3：Document 隱藏儲存
+                try {
+                    console.log('🔍 檢查 Document 標題...', document.title);
+                    const value = this.getFromDocument(key);
+                    if (value) {
+                        console.log(`✅ 從 Document 恢復: ${key}`);
+                        // 恢復到 LocalStorage
+                        await setLocalData(key, value, 30);
+                        return value;
+                    }
+                } catch (error) {
+                    console.error('Document 讀取失敗:', error);
+                }
+                
+                console.log(`❌ 所有方法都無法找到: ${key}`);
+                return null;
+            }
+
+            // 超級清除
+            async superClear(key) {
+                console.log(`🧹 開始超級清除: ${key}`);
+                
+                // 清除所有可能的儲存位置
+                try {
+                    await deleteLocalData(key);
+                } catch (error) {
+                    console.error('LocalStorage 清除失敗:', error);
+                }
+                
+                // 清除 URL 參數中的資料
+                try {
+                    const hash = location.hash;
+                    if (hash.includes('data=')) {
+                        const newHash = hash.replace(/[?&]data=[^&]*/, '');
+                        if (history.replaceState) {
+                            history.replaceState(null, '', location.pathname + location.search + newHash);
+                        }
+                    }
+                } catch (error) {
+                    console.error('URL 參數清除失敗:', error);
+                }
+                
+                // 清除 Document 資料
+                try {
+                    const title = document.title;
+                    const cleanTitle = title.replace(/\u200B.+$/, '');
+                    document.title = cleanTitle;
+                } catch (error) {
+                    console.error('Document 清除失敗:', error);
+                }
+                
+                console.log(`✅ 超級清除完成: ${key}`);
+            }
+        }
+
+        // 創建超級持久化存儲實例
+        const superStorage = new SuperPersistentStorage();
+
+        // LocalStorage 操作工具（帶 IndexedDB 備用）
+        window.setLocalData = async (name, value, days = 30) => {
+            const expires = new Date();
+            expires.setTime(expires.getTime() + (days * 24 * 60 * 60 * 1000));
+            
+            const data = {
+                value: value,
+                expires: expires.toISOString(),
+                created: new Date().toISOString()
+            };
+            
+            let success = false;
+            
+            try {
+                // 方案1：LocalStorage（主要）
+                const fullKey = 'sps_' + name;
+                const jsonData = JSON.stringify(data);
+                localStorage.setItem(fullKey, jsonData);
+                console.log(`� LocalStorage已設置: ${name} = ${value} (完整鍵名: ${fullKey})`);
+                
+                // 驗證儲存
+                const verification = localStorage.getItem(fullKey);
+                if (verification === jsonData) {
+                    success = true;
+                    console.log(`✅ LocalStorage儲存驗證成功: ${name}`);
+                } else {
+                    console.error(`❌ LocalStorage儲存驗證失敗: ${name}`);
+                }
+                
+                // 備用方案：直接鍵名
+                try {
+                    const backupKey1 = `SPS_${name.toUpperCase()}`;
+                    localStorage.setItem(backupKey1, jsonData);
+                    console.log(`🔄 備用儲存1: ${backupKey1}`);
+                    
+                    const simpleKey = `simple_${name}`;
+                    localStorage.setItem(simpleKey, value);
+                    console.log(`🔄 備用儲存2: ${simpleKey} = ${value}`);
+                } catch (backupError) {
+                    console.error('備用 LocalStorage 失敗:', backupError);
+                }
+                
+            } catch (error) {
+                console.error('❌ LocalStorage設置失敗:', error);
+            }
+            
+            // 方案2：SessionStorage（臨時備用）
+            try {
+                sessionStorage.setItem('sps_' + name, JSON.stringify(data));
+                console.log(`⚡ SessionStorage備用: ${name}`);
+            } catch (sessionError) {
+                console.error('❌ SessionStorage設置失敗:', sessionError);
+            }
+            
+            // 方案3：SessionStorage（臨時備用）
+            try {
+                sessionStorage.setItem('sps_' + name, JSON.stringify(data));
+                console.log(`⚡ SessionStorage備用: ${name}`);
+            } catch (sessionError) {
+                console.error('❌ SessionStorage設置失敗:', sessionError);
+            }
+            
+            return success;
+        };
+
+        window.getLocalData = async (name) => {
+            try {
+                const fullKey = 'sps_' + name;
+                
+                // 方案1：檢查 LocalStorage
+                const exists = localStorage.hasOwnProperty(fullKey) || (fullKey in localStorage);
+                console.log(`🔍 檢查鍵是否存在: ${fullKey} = ${exists}`);
+                
+                let dataStr = localStorage.getItem(fullKey);
+                let source = '主要儲存';
+                
+                // 如果主要儲存沒有資料，嘗試備用方案
+                if (!dataStr) {
+                    console.log(`📭 主要儲存無資料，檢查備用方案...`);
+                    
+                    // 備用方案1：不同鍵名格式
+                    const backupKey1 = `SPS_${name.toUpperCase()}`;
+                    dataStr = localStorage.getItem(backupKey1);
+                    if (dataStr) {
+                        source = '備用儲存1';
+                        console.log(`🔄 從備用儲存1找到資料: ${backupKey1}`);
+                    }
+                    
+                    // 備用方案2：簡單值儲存
+                    if (!dataStr) {
+                        const simpleKey = `simple_${name}`;
+                        const simpleValue = localStorage.getItem(simpleKey);
+                        if (simpleValue) {
+                            console.log(`🔄 從備用儲存2找到資料: ${simpleKey} = ${simpleValue}`);
+                            return simpleValue;
+                        }
+                    }
+                    
+                    // 備用方案3：sessionStorage
+                    if (!dataStr) {
+                        dataStr = sessionStorage.getItem('sps_' + name);
+                        if (dataStr) {
+                            source = 'SessionStorage';
+                            console.log(`⚡ 從 SessionStorage 找到資料`);
+                        }
+                    }
+                }
+                
+                console.log(`📋 原始資料 (${source}): ${fullKey} = ${dataStr ? dataStr.substring(0, 100) + (dataStr.length > 100 ? '...' : '') : 'null'}`);
+                
+                // 如果 LocalStorage 都沒有，嘗試 IndexedDB
+                if (!dataStr) {
+                    console.log(`�️ 檢查 IndexedDB...`);
+                    try {
+                        const idbValue = "removed";
+                        if (false) {
+                            console.log(`✅ 從 IndexedDB 找到資料: ${name} = ${idbValue}`);
+                            return idbValue;
+                        }
+                    } catch (idbError) {
+                        console.error('❌ IndexedDB 讀取失敗:', idbError);
+                    }
+                }
+                
+                if (!dataStr) {
+                    console.log(`�📭 LocalStorage無資料: ${name} (完整鍵名: ${fullKey})`);
+                    
+                    // 額外檢查：列出所有相關的鍵
+                    console.log('🔍 檢查所有相關鍵:');
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const key = localStorage.key(i);
+                        if (key.includes('sps_') || key.includes(name) || key.includes('SPS_') || key.includes('simple_')) {
+                            console.log(`  找到相關鍵: ${key}`);
+                        }
+                    }
+                    return null;
+                }
+                
+                const data = JSON.parse(dataStr);
+                
+                // 檢查是否過期
+                if (data.expires && new Date(data.expires) < new Date()) {
+                    localStorage.removeItem(fullKey);
+                    console.log(`⏰ LocalStorage資料已過期並清除: ${name}`);
+                    return null;
+                }
+                
+                console.log(`📤 LocalStorage讀取成功 (${source}): ${name} = ${data.value}`);
+                return data.value;
+            } catch (error) {
+                console.error('❌ LocalStorage讀取失敗:', error);
+                return null;
+            }
+        };
+
+        window.deleteLocalData = async (name) => {
+            try {
+                const fullKey = 'sps_' + name;
+                
+                // 清除 LocalStorage 的所有版本
+                localStorage.removeItem(fullKey);
+                localStorage.removeItem(`SPS_${name.toUpperCase()}`);
+                localStorage.removeItem(`simple_${name}`);
+                sessionStorage.removeItem('sps_' + name);
+                
+                console.log(`🗑️ LocalStorage已刪除: ${name} (完整鍵名: ${fullKey})`);
+                
+                return true;
+            } catch (error) {
+                console.error('❌ LocalStorage刪除失敗:', error);
+                return false;
+            }
+        };
+
+        // 同步版本的 getCookie（備用，僅支援 LocalStorage）
+        window.getCookieSync = (name) => {
+            try {
+                const fullKey = 'sps_' + name;
+                const dataStr = localStorage.getItem(fullKey);
+                if (!dataStr) return null;
+                
+                const data = JSON.parse(dataStr);
+                if (data.expires && new Date(data.expires) < new Date()) {
+                    localStorage.removeItem(fullKey);
+                    return null;
+                }
+                
+                return data.value;
+            } catch (error) {
+                return null;
+            }
+        };
+
+        // 向後相容的Cookie API（異步版本優先，同步版本備用）
+        window.setCookie = window.setLocalData;
+        window.getCookie = window.getLocalData;
+        window.deleteCookie = window.deleteLocalData;
+
+        // 登入會話管理（針對Google Sites優化）
+        class LoginSessionManager {
+            constructor() {
+                this.sessionKey = 'sps_login_session';
+                this.accountKey = 'rememberedAccount';
+                this.autoLoginKey = 'auto_login_token'; // 修正：移除重複的sps_前綴
+                this.isAutoLoggedIn = false; // 標記是否為自動登入
+                this.isGoogleSites = this.detectGoogleSites();
+                
+                if (this.isGoogleSites) {
+                    console.log('🌐 Google Sites 環境：使用伺服器端會話管理');
+                } else {
+                    console.log('📱 一般環境：使用客戶端存儲');
+                }
+            }
+
+            detectGoogleSites() {
+                // 臨時強制啟用 Google Sites 模式用於測試
+                const forceGoogleSites = true; // 設為 true 來測試
+                
+                const realDetection = window.location.hostname.includes('sites.google.com') || 
+                                    document.referrer.includes('sites.google.com') ||
+                                    window.parent !== window; // 在 iframe 中
+                
+                const result = forceGoogleSites || realDetection;
+                console.log(`🔍 [LoginSessionManager] Google Sites 檢測: force=${forceGoogleSites}, real=${realDetection}, result=${result}`);
+                return result;
+            }
+
+            // 保存登入會話
+            async saveLoginSession(userInfo, rememberMe = false) {
+                console.log(`🔄 開始保存登入會話: 使用者=${userInfo?.account || userInfo?.user_id || 'Unknown'}, 記住登入=${rememberMe}`);
+                
+                // 安全檢查：確保 userInfo 存在且有必要的屬性
+                if (!userInfo) {
+                    console.error('❌ [錯誤] userInfo 為 null 或 undefined');
+                    return false;
+                }
+                
+                if (!userInfo.id && !userInfo.user_id) {
+                    console.error('❌ [錯誤] userInfo 缺少 id 或 user_id 屬性:', userInfo);
+                    return false;
+                }
+                
+                // 標準化 user ID
+                const userId = userInfo.id || userInfo.user_id;
+                
+                // 如果是 Google Sites 環境，使用新的會話管理器
+                if (this.isGoogleSites) {
+                    console.log('🌐 [Google Sites] 使用伺服器端會話管理');
+                    if (rememberMe) {
+                        const success = await googleSitesSession.saveLoginSession(userId, rememberMe);
+                        if (success) {
+                            console.log('🎉 [Google Sites] 記憶登入設置完成！');
+                        }
+                    } else {
+                        console.log('❌ [Google Sites] 未勾選記住登入，跳過會話保存');
+                    }
+                    this.isAutoLoggedIn = false; // 這是正常登入，不是自動登入
+                    return true; // Google Sites 環境下總是返回成功
+                }
+                
+                console.log('📱 [一般環境] 使用客戶端存儲');
+                // 一般環境的邏輯保持不變
+                const sessionData = {
+                    userId: userId,
+                    email: userInfo.email,
+                    account: userInfo.account || userInfo.user_id,
+                    loginTime: new Date().toISOString(),
+                    rememberMe: rememberMe,
+                    environment: this.isGoogleSites ? 'google-sites' : 'standard'
+                };
+
+                // 保存會話到 localStorage
+                try {
+                    localStorage.setItem(this.sessionKey, JSON.stringify(sessionData));
+                    console.log('✅ 登入會話已保存到 LocalStorage');
+                } catch (error) {
+                    console.error('❌ 保存登入會話失敗:', error);
+                }
+
+                if (rememberMe) {
+                    console.log('🔐 開始設置記憶登入功能...');
+                    
+                    // 使用超級存儲保存帳號 (30天)
+                    try {
+                        const accountSaved = await superStorage.superSave(this.accountKey, sessionData.account, 30);
+                        console.log(`${accountSaved ? '✅' : '❌'} 帳號記憶超級保存: ${this.accountKey} = ${sessionData.account}`);
+                    } catch (error) {
+                        console.error('❌ 保存帳號記憶失敗:', error);
+                    }
+                    
+                    // 生成自動登入令牌並使用超級存儲保存
+                    const autoLoginToken = this.generateAutoLoginToken();
+                    try {
+                        const tokenSaved = await superStorage.superSave(this.autoLoginKey, autoLoginToken, 30);
+                        console.log(`${tokenSaved ? '✅' : '❌'} 令牌超級保存: ${this.autoLoginKey} = ${autoLoginToken.substring(0, 16)}...`);
+                        
+                        // 保存到資料庫
+                        await this.saveAutoLoginToken(userInfo.id, autoLoginToken);
+                        console.log('✅ 自動登入令牌已保存到資料庫');
+                        
+                        console.log('🎉 記憶登入設置完成！');
+                    } catch (error) {
+                        console.error('❌ 保存自動登入令牌失敗:', error);
+                    }
+                } else {
+                    console.log('⚠️ 未勾選記住登入，清除相關資料...');
+                    // 不記住登入時，清除相關資料
+                    try {
+                        await superStorage.superClear(this.accountKey);
+                        await superStorage.superClear(this.autoLoginKey);
+                    } catch (error) {
+                        console.error('❌ 清除記憶資料失敗:', error);
+                    }
+                }
+
+                // 清除自動登入標記（因為這是正常登入）
+                this.isAutoLoggedIn = false;
+            }
+
+            // 生成自動登入令牌
+            generateAutoLoginToken() {
+                const array = new Uint8Array(32);
+                crypto.getRandomValues(array);
+                return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+            }
+
+            // 保存自動登入令牌到資料庫
+            async saveAutoLoginToken(userId, token) {
+                const expiresAt = new Date();
+                expiresAt.setDate(expiresAt.getDate() + 30); // 30天過期
+
+                const { error } = await supabase
+                    .from('login_sessions')
+                    .upsert({
+                        user_id: userId,
+                        auto_login_token: token,
+                        expires_at: expiresAt.toISOString(),
+                        created_at: new Date().toISOString(),
+                        last_used: new Date().toISOString(),
+                        user_agent: navigator.userAgent,
+                        ip_address: null, // 如果需要記錄IP，可以通過API獲取
+                        is_active: true
+                    }, {
+                        onConflict: 'user_id'
+                    });
+
+                if (error) throw error;
+            }
+
+            // 檢查並執行自動登入
+            async checkAutoLogin() {
+                console.log('🔍 開始檢查自動登入...');
+                
+                // 如果是 Google Sites 環境，使用新的會話管理器
+                if (this.isGoogleSites) {
+                    const result = await googleSitesSession.checkAutoLogin();
+                    if (result && result.success) {
+                        this.isAutoLoggedIn = true;
+                        return true;
+                    }
+                    return false;
+                }
+                
+                // 一般環境的邏輯保持不變
+                const autoLoginToken = await superStorage.superGet(this.autoLoginKey);
+                if (!autoLoginToken) {
+                    console.log('❌ 沒有找到自動登入令牌');
+                    return false;
+                }
+
+                console.log(`✅ 找到自動登入令牌: ${autoLoginToken.substring(0, 16)}...`);
+                console.log('🔄 開始驗證令牌...');
+
+                try {
+                    // 驗證自動登入令牌
+                    const { data, error } = await supabase
+                        .from('login_sessions')
+                        .select('user_id, expires_at, users(email)')
+                        .eq('auto_login_token', autoLoginToken)
+                        .eq('is_active', true)
+                        .single();
+
+                    if (error || !data) {
+                        console.log('❌ 自動登入令牌無效或不存在:', error?.message);
+                        await superStorage.superClear(this.autoLoginKey);
+                        return false;
+                    }
+
+                    console.log('✅ 令牌驗證成功');
+
+                    // 檢查令牌是否過期
+                    if (new Date(data.expires_at) < new Date()) {
+                        console.log('❌ 自動登入令牌已過期');
+                        await superStorage.superClear(this.autoLoginKey);
+                        await this.clearExpiredSession(autoLoginToken);
+                        return false;
+                    }
+
+                    console.log('✅ 令牌未過期，獲取使用者資訊...');
+
+                    // 獲取使用者資訊並自動登入
+                    const { data: userProfile, error: userError } = await supabase
+                        .from('users')
+                        .select('*')
+                        .eq('id', data.user_id)
+                        .single();
+
+                    if (userError || !userProfile) {
+                        console.error('❌ 自動登入失敗：找不到使用者', userError);
+                        return false;
+                    }
+
+                    console.log(`✅ 使用者資訊獲取成功: ${userProfile.name}`);
+
+                    // 更新最後使用時間
+                    await supabase
+                        .from('login_sessions')
+                        .update({ last_used: new Date().toISOString() })
+                        .eq('auto_login_token', autoLoginToken);
+
+                    // 設置本地狀態（模擬登入）
+                    state.currentUser = userProfile;
+                    state.local.dashboardFilters.permission = 'pending_for_me';
+                    
+                    if (userProfile.favorite_products && Array.isArray(userProfile.favorite_products)) {
+                        state.local.favoriteProductIds = new Set(userProfile.favorite_products);
+                    } else {
+                        state.local.favoriteProductIds = new Set();
+                    }
+
+                    // 套用個人設定
+                    if (userProfile.theme_preference) {
+                        applyTheme(userProfile.theme_preference);
+                    }
+                    if (userProfile.menu_layout) {
+                        state.local.layoutScale = userProfile.menu_layout === 'compact' ? 'compact' : 'expanded';
+                        localStorage.setItem('menuLayout', state.local.layoutScale);
+                    }
+
+                    console.log(`🎉 ${this.isGoogleSites ? '[Google Sites]' : ''} 自動登入成功: ${userProfile.name}`);
+                    this.isAutoLoggedIn = true; // 設置自動登入標記
+                    return true;
+
+                } catch (error) {
+                    console.error('❌ 自動登入檢查失敗:', error);
+                    await superStorage.superClear(this.autoLoginKey);
+                    return false;
+                }
+            }
+
+            // 清除過期的會話
+            async clearExpiredSession(token) {
+                try {
+                    await supabase
+                        .from('login_sessions')
+                        .delete()
+                        .eq('auto_login_token', token);
+                } catch (error) {
+                    console.error('清除過期會話失敗:', error);
+                }
+            }
+
+            // 清除登入會話
+            async clearLoginSession() {
+                const autoLoginToken = await superStorage.superGet(this.autoLoginKey);
+                
+                // 從資料庫清除會話
+                if (autoLoginToken) {
+                    try {
+                        await supabase
+                            .from('login_sessions')
+                            .delete()
+                            .eq('auto_login_token', autoLoginToken);
+                        console.log('資料庫會話已清除');
+                    } catch (error) {
+                        console.error('清除資料庫會話失敗:', error);
+                    }
+                }
+
+                // 清除本地存儲
+                try {
+                    localStorage.removeItem(this.sessionKey);
+                    await superStorage.superClear(this.autoLoginKey);
+                    await superStorage.superClear(this.accountKey);
+                    console.log(`${this.isGoogleSites ? '[Google Sites]' : ''} 本地會話已清除`);
+                } catch (error) {
+                    console.error('清除本地存儲失敗:', error);
+                }
+                
+                // 清除自動登入標記
+                this.isAutoLoggedIn = false;
+            }
+
+            // 獲取當前會話資訊
+            getSessionInfo() {
+                const sessionStr = localStorage.getItem(this.sessionKey);
+                return sessionStr ? JSON.parse(sessionStr) : null;
+            }
+        }
+
+        // 創建全域登入會話管理器
+        window.loginSessionManager = new LoginSessionManager();
     </script>
 
     <style>
@@ -3020,6 +4337,7 @@
         <div id="personalForms-view" class="view"></div>
         <div id="userManagement-view" class="view"></div>
     <div id="departmentManagement-view" class="view"></div>
+    <div id="sessionManagement-view" class="view"></div>
         <div id="userForm-view" class="view"></div>
     <div id="departmentForm-view" class="view"></div>
         <div id="vendorManagement-view" class="view"></div>
@@ -3033,7 +4351,7 @@
     </div>
 
     <script type="module">
-        // --- Theme Management ---
+        // --- Theme Management --- (global `state` already declared earlier)
     const applyTheme = (theme) => {
             const themeClasses = ['theme-apple','theme-scifi','theme-ghibli','theme-abstract','theme-colorful','theme-luhong','theme-lugreen','theme-forest','theme-ocean','theme-sunset','theme-midnight','theme-sakura','theme-care-soft','theme-care-fresh','theme-med-clean','theme-med-trust','theme-hotel-lux','theme-hotel-resort','theme-nord','theme-latte','theme-mint','theme-solar','theme-slate','theme-metro','theme-pastel','theme-neon','theme-retro','theme-minimal','theme-paper','theme-grape','theme-cobalt','theme-sand','theme-rosewood','theme-aurora','theme-cocoa','theme-denim','theme-lime','theme-coral','theme-plum','theme-sky','theme-graphite','theme-pearl','theme-rust','theme-berry','theme-moss','theme-teal','theme-sepia','theme-charcoal','theme-ivory','theme-azure','theme-blush','theme-saffron','theme-indigo','theme-copper','theme-lavender','theme-steel','theme-clay','theme-cyan','theme-olive','theme-marigold','theme-orchid','theme-flamingo','theme-iceberg','theme-blossom','theme-jade','theme-cinder','theme-fern','theme-glacier','theme-ember','theme-horizon','theme-canyon','theme-lagoon','theme-meadow','theme-tundra','theme-dune','theme-willow','theme-bronze','theme-silver','theme-gold','theme-amethyst','theme-sapphire','theme-ruby','theme-emerald','theme-topaz','theme-garnet','theme-quartz','theme-onyx','theme-obsidian','theme-smoke','theme-cloud','theme-storm','theme-frost','theme-cherry','theme-espresso','theme-mocha','theme-avocado','theme-banana','theme-plumeria','theme-reef','theme-seafoam','theme-pine','theme-iron','theme-carbon','theme-navy','theme-air','theme-violet','theme-caramel','theme-peach','theme-lilac','theme-rose','theme-magenta','theme-periwinkle','theme-teak'];
             document.body.classList.remove(...themeClasses);
@@ -3816,70 +5134,6 @@
         ];
 
         // --- 應用程式狀態與設定 ---
-        let state = {
-            theme: 'default',
-            view: 'login',
-            requests: [],
-            products: {}, // 分類後的產品
-            allProducts: [], // 所有產品列表
-            vendors: [], // 廠商列表
-            users: {}, // key 是 user uuid
-            categories: [],
-            departments: {},
-            applicantNotifications: [],
-            currentUser: null, // 包含從 users 表來的 profile
-            selectedRequest: null,
-            editingRequest: null, // *** NEW: 正在編輯的草稿 ***
-            editingProduct: null,
-            editingUser: null,
-            editingVendor: null, 
-            loading: true,
-            error: null,
-            local: {
-                dashboardFilters: {
-                    vendors: new Set(),
-                    statuses: new Set(),
-                    handlerStatuses: new Set(),
-                    closedStatuses: new Set(),
-                },
-                personalForms: {
-                    activeTab: 'inbox', 
-                    inbox: { searchTerm: '' },
-                    sent: { status: 'all', searchTerm: '', dateFrom: '', dateTo: '' },
-                    history: { status: 'all', searchTerm: '', dateFrom: '', dateTo: '' },
-                    handler: { status: 'all', handlerStatus: 'all', searchTerm: '', dateFrom: '', dateTo: '' },
-                    closed: { status: 'all', searchTerm: '', dateFrom: '', dateTo: '' },
-                },
-                userManagementFilters: {
-                    department: 'all',
-                    searchTerm: ''
-                },
-                departmentManagementSearchTerm: '',
-                vendorManagementSearchTerm: '',
-                newRequestCart: [],
-                activeProductCategory: '我的最愛',
-                activeProductManagementCategory: '全品項',
-                selectedRequestIds: new Set(),
-                currentPage: 1,
-                itemsPerPage: 10,
-                permissionFilter: 'my', 
-                consolidatedData: null,
-                sortKey: 'request_date', 
-                sortDirection: 'desc',
-                productManagementSearchTerm: '',
-                newRequestSearchTerm: '',
-                newRequestSearchAll: false,
-                newRequestCurrentPage: 1,
-                productSortKey: 'id',
-                productSortDirection: 'asc',
-                productFilters: {},
-                favoriteProductIds: new Set(),
-                layoutScale: 'expanded', // 'expanded' = 3:2 (+), 'compact' = 2:3 (-)
-                // 申請單附件（在送出/儲存前的本地暫存）
-                newRequestAttachments: []
-            }
-        };
-
         // --- Supabase API 呼叫函式 ---
         const { supabase } = window;
         
@@ -4256,7 +5510,7 @@
                         });
                     }
 
-                    const views = ['login-view', 'dashboard-view', 'newRequest-view', 'detailView-view', 'productManagement-view', 'productForm-view', 'personalForms-view', 'userManagement-view', 'departmentManagement-view', 'userForm-view', 'departmentForm-view', 'vendorManagement-view', 'vendorForm-view', 'printManagement-view'];
+                    const views = ['login-view', 'dashboard-view', 'newRequest-view', 'detailView-view', 'productManagement-view', 'productForm-view', 'personalForms-view', 'userManagement-view', 'departmentManagement-view', 'sessionManagement-view', 'userForm-view', 'departmentForm-view', 'vendorManagement-view', 'vendorForm-view', 'printManagement-view'];
                     updates.push(() => {
                         views.forEach(v => {
                             const el = document.getElementById(v);
@@ -4539,20 +5793,29 @@
 
         const renderLoginView = () => {
             const viewEl = document.getElementById('login-view');
+            const rememberedAccount = getCookieSync('rememberedAccount') || '';
+            const isGoogleSites = location.hostname.includes('sites.google.com');
+            
             viewEl.innerHTML = `
                 <div class="min-h-screen flex items-center justify-center">
                     <div class="max-w-md w-full bg-white p-8 rounded-lg shadow-lg">
                         <h2 class="text-2xl font-bold text-center mb-6">特採系統登入</h2>
+                        ${isGoogleSites ? '<div class="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-md text-sm text-blue-800">⚡ Google Sites 環境：使用 LocalStorage 實現記憶登入功能</div>' : ''}
                         <form id="login-form">
                             <div class="mb-4">
                                 <label for="account" class="block text-sm font-medium text-gray-700">帳號 (工號、ID 或 Email)</label>
-                                <input type="text" id="account" name="account" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+                                <input type="text" id="account" name="account" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm" value="${rememberedAccount}">
                             </div>
-                            <div class="mb-6">
+                            <div class="mb-4">
                                 <label for="password" class="block text-sm font-medium text-gray-700">密碼</label>
                                 <input type="password" id="password" name="password" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
                             </div>
+                            <div class="mb-6 flex items-center">
+                                <input type="checkbox" id="rememberMe" name="rememberMe" class="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded" ${rememberedAccount ? 'checked' : ''}>
+                                <label for="rememberMe" class="text-sm text-gray-700">記住我的登入資訊 (30天)</label>
+                            </div>
                             <button type="submit" class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700">登入</button>
+                            ${rememberedAccount ? '<p class="text-xs text-gray-500 mt-2 text-center">已自動填入上次登入的帳號</p>' : ''}
                         </form>
                     </div>
                 </div>`;
@@ -4562,6 +5825,19 @@
         // --- 視圖渲染器 ---
         window.renderDashboard = () => {
             const viewEl = document.getElementById('dashboard-view');
+            
+            // 安全檢查：確保 currentUser 存在
+            if (!state.currentUser) {
+                console.warn('⚠️ [Dashboard] state.currentUser 不存在，使用預設值');
+                state.currentUser = {
+                    id: 'auto_login_user',
+                    name: '自動登入使用者',
+                    role: '使用者',
+                    department: '未知部門',
+                    is_admin: false
+                };
+            }
+            
             const { currentUser } = state;
             const isPurchasing = currentUser.role === '採購' || currentUser.role === '採購主管' || currentUser.is_admin;
             const isAdmin = currentUser.is_admin;
@@ -4603,6 +5879,7 @@
                         ` : ''}
                         ${isAdmin ? '<button data-view="departmentManagement" class="view-switch-btn px-4 py-2 rounded-md font-semibold text-sm bg-gray-200 hover:bg-gray-300">部門管理</button>' : ''}
                         ${isAdmin ? '<button data-view="userManagement" class="view-switch-btn px-4 py-2 rounded-md font-semibold text-sm bg-gray-200 hover:bg-gray-300">使用者管理</button>' : ''}
+                        ${isAdmin ? '<button data-view="sessionManagement" class="view-switch-btn px-4 py-2 rounded-md font-semibold text-sm bg-orange-500 text-white hover:bg-orange-600">會話管理</button>' : ''}
                         ${(isPurchasing || currentUser.is_admin) ? `
                             <button data-view="vendorManagement" class="view-switch-btn px-4 py-2 rounded-md font-semibold text-sm bg-gray-200 hover:bg-gray-300">廠商管理</button>
                             <button data-view="productManagement" class="view-switch-btn px-4 py-2 rounded-md font-semibold text-sm bg-gray-200 hover:bg-gray-300">商品管理</button>
@@ -7143,6 +8420,127 @@
             viewEl.style.display = 'block';
         };
 
+        // 會話管理列表
+        window.renderSessionManagement = async function() {
+            const viewEl = document.getElementById('sessionManagement-view');
+            
+            try {
+                // 獲取所有活躍的登入會話
+                const { data: sessions, error } = await supabase
+                    .from('login_sessions')
+                    .select(`
+                        *,
+                        users (name, email, user_id, department)
+                    `)
+                    .eq('is_active', true)
+                    .order('last_used', { ascending: false });
+
+                if (error) throw error;
+
+                const now = new Date();
+                const activeSessions = sessions?.filter(session => 
+                    new Date(session.expires_at) > now
+                ) || [];
+
+                viewEl.innerHTML = `
+                    <div class="bg-white shadow-sm mb-6 p-4 rounded-lg flex justify-between items-center sticky top-0 z-10">
+                        <h1 class="text-2xl font-bold text-gray-700">登入會話管理</h1>
+                        <div class="flex space-x-4">
+                            <button data-view="dashboard" class="view-switch-btn px-4 py-2 rounded-md font-semibold text-sm bg-gray-200 hover:bg-gray-300">返回列表</button>
+                            <button data-action="cleanup-expired-sessions" class="px-4 py-2 rounded-md font-semibold text-sm bg-red-600 text-white hover:bg-red-700">清除過期會話</button>
+                            <button data-action="refresh-sessions" class="px-4 py-2 rounded-md font-semibold text-sm bg-blue-600 text-white hover:bg-blue-700">重新整理</button>
+                        </div>
+                    </div>
+                    <div class="bg-white shadow-md rounded-lg p-6">
+                        <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div class="bg-green-50 border border-green-200 rounded-lg p-4">
+                                <div class="text-green-800 text-sm font-medium">活躍會話</div>
+                                <div class="text-2xl font-bold text-green-900">${activeSessions.length}</div>
+                            </div>
+                            <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+                                <div class="text-yellow-800 text-sm font-medium">今日登入</div>
+                                <div class="text-2xl font-bold text-yellow-900">${activeSessions.filter(s => 
+                                    new Date(s.created_at).toDateString() === now.toDateString()
+                                ).length}</div>
+                            </div>
+                            <div class="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                                <div class="text-blue-800 text-sm font-medium">記住登入</div>
+                                <div class="text-2xl font-bold text-blue-900">${activeSessions.length}</div>
+                            </div>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full divide-y divide-gray-200">
+                                <thead class="bg-gray-50">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">使用者</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">部門</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">建立時間</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">最後使用</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">過期時間</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">瀏覽器</th>
+                                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase">狀態</th>
+                                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="bg-white divide-y divide-gray-200">
+                                    ${activeSessions.map(session => {
+                                        const user = session.users;
+                                        const isExpiringSoon = new Date(session.expires_at) - now < 7 * 24 * 60 * 60 * 1000; // 7天內過期
+                                        const browserInfo = session.user_agent ? 
+                                            session.user_agent.includes('Chrome') ? 'Chrome' :
+                                            session.user_agent.includes('Firefox') ? 'Firefox' :
+                                            session.user_agent.includes('Safari') ? 'Safari' :
+                                            session.user_agent.includes('Edge') ? 'Edge' : '其他'
+                                            : '未知';
+                                        
+                                        return `
+                                            <tr class="${isExpiringSoon ? 'bg-yellow-50' : ''}">
+                                                <td class="px-6 py-4 whitespace-nowrap">
+                                                    <div class="text-sm font-medium text-gray-900">${user?.name || '未知'}</div>
+                                                    <div class="text-sm text-gray-500">${user?.email || session.user_id.substring(0, 8)}</div>
+                                                    <div class="text-xs text-gray-400">${user?.user_id || ''}</div>
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${user?.department || '未設定'}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${getFormattedDateTime(session.created_at)}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${getFormattedDateTime(session.last_used)}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm ${isExpiringSoon ? 'text-yellow-600 font-medium' : 'text-gray-900'}">${getFormattedDateTime(session.expires_at)}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${browserInfo}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-center">
+                                                    <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                                                        isExpiringSoon ? 'bg-yellow-100 text-yellow-800' : 'bg-green-100 text-green-800'
+                                                    }">
+                                                        ${isExpiringSoon ? '即將過期' : '正常'}
+                                                    </span>
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-center text-sm font-medium">
+                                                    <button data-session-id="${session.id}" data-action="revoke-session" class="text-red-600 hover:text-red-900">撤銷</button>
+                                                </td>
+                                            </tr>
+                                        `;
+                                    }).join('') || `<tr><td colspan="8" class="text-center py-10 text-gray-500">目前沒有活躍的登入會話</td></tr>`}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+            } catch (error) {
+                console.error('載入會話資料失敗:', error);
+                viewEl.innerHTML = `
+                    <div class="bg-white shadow-sm mb-6 p-4 rounded-lg flex justify-between items-center sticky top-0 z-10">
+                        <h1 class="text-2xl font-bold text-gray-700">登入會話管理</h1>
+                        <button data-view="dashboard" class="view-switch-btn px-4 py-2 rounded-md font-semibold text-sm bg-gray-200 hover:bg-gray-300">返回列表</button>
+                    </div>
+                    <div class="bg-white shadow-md rounded-lg p-6">
+                        <div class="text-center py-10 text-red-500">
+                            載入會話資料失敗：${error.message}
+                        </div>
+                    </div>
+                `;
+            }
+            
+            viewEl.style.display = 'block';
+        };
+
         // 部門表單
         window.renderDepartmentForm = function() {
             const viewEl = document.getElementById('departmentForm-view');
@@ -7688,6 +9086,8 @@
                 return;
             }
             if (e.target.id === 'logout-btn') {
+                // 清除登入會話資訊
+                loginSessionManager.clearLoginSession().catch(console.error);
                 supabase.auth.signOut();
                 return;
             }
@@ -12338,6 +13738,67 @@
                 }
             }
         });
+
+        // 會話管理事件處理器
+        document.getElementById('sessionManagement-view').addEventListener('click', async (e) => {
+            const button = e.target.closest('button');
+            if (!button) return;
+            const action = button.dataset.action;
+
+            if (action === 'refresh-sessions') {
+                try {
+                    await renderSessionManagement();
+                    showMessage('會話列表已更新', 'success');
+                } catch (error) {
+                    showMessage('更新會話列表失敗：' + error.message, 'error');
+                }
+            } else if (action === 'cleanup-expired-sessions') {
+                if (!confirm('確定要清除所有過期的會話嗎？')) return;
+                
+                try {
+                    updateState({ loading: true });
+                    
+                    // 清除過期會話
+                    const { error } = await supabase
+                        .from('login_sessions')
+                        .delete()
+                        .or('expires_at.lt.now(),is_active.eq.false');
+                    
+                    if (error) throw error;
+                    
+                    showMessage('已清除過期會話', 'success');
+                    await renderSessionManagement();
+                } catch (error) {
+                    console.error('清除過期會話失敗:', error);
+                    showMessage('清除過期會話失敗：' + error.message, 'error');
+                } finally {
+                    updateState({ loading: false });
+                }
+            } else if (action === 'revoke-session') {
+                const sessionId = button.dataset.sessionId;
+                if (!confirm('確定要撤銷此登入會話嗎？該使用者將需要重新登入。')) return;
+                
+                try {
+                    updateState({ loading: true });
+                    
+                    // 撤銷指定會話
+                    const { error } = await supabase
+                        .from('login_sessions')
+                        .update({ is_active: false })
+                        .eq('id', sessionId);
+                    
+                    if (error) throw error;
+                    
+                    showMessage('會話已撤銷', 'success');
+                    await renderSessionManagement();
+                } catch (error) {
+                    console.error('撤銷會話失敗:', error);
+                    showMessage('撤銷會話失敗：' + error.message, 'error');
+                } finally {
+                    updateState({ loading: false });
+                }
+            }
+        });
         
         document.body.addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -12345,6 +13806,7 @@
             if (e.target.id === 'login-form') {
                 const account = e.target.elements.account.value;
                 const password = e.target.elements.password.value;
+                const rememberMe = e.target.elements.rememberMe.checked;
                 let email = account;
 
                 updateState({ loading: true, error: null }); 
@@ -12368,6 +13830,33 @@
 
                     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
                     if (error) throw error;
+
+                    // 登入成功後保存會話資訊
+                    if (data.user) {
+                        console.log('📊 檢查登入後的 data.user 結構:', data.user);
+                        
+                        const userInfo = {
+                            id: data.user.id || data.user.user_id || null,
+                            email: email,
+                            account: account,
+                            user_id: account
+                        };
+                        
+                        console.log('📊 構建的 userInfo 對象:', userInfo);
+                        
+                        // 確保有有效的 ID 才保存會話
+                        if (userInfo.id) {
+                            await loginSessionManager.saveLoginSession(userInfo, rememberMe);
+                        } else {
+                            console.warn('⚠️ 警告：data.user 缺少 id 屬性，跳過會話保存');
+                        }
+                        
+                        // 顯示登入成功訊息
+                        showMessage(`歡迎回來${rememberMe ? '，已記住您的登入資訊' : ''}！`, 'success');
+                    } else {
+                        console.warn('⚠️ 警告：登入成功但 data.user 為空');
+                        showMessage('登入成功！', 'success');
+                    }
 
                 } catch (error) {
                     let message = "登入失敗，請檢查您的帳號和密碼。";
@@ -12432,6 +13921,12 @@
                 }
             } 
             else {
+                // 沒有 Supabase session 時，檢查是否有現有的自動登入狀態
+                if (state.currentUser) {
+                    console.log('檢測到 Supabase session 結束，但有自動登入狀態，保持登入');
+                    return; // 保持當前狀態，不要清除
+                }
+                
                 channels.forEach(channel => supabase.removeChannel(channel));
                 channels = [];
                 Object.assign(state, {
@@ -12517,13 +14012,119 @@
         }
 
         // 初始化所有優化功能
-        document.addEventListener('DOMContentLoaded', () => {
+        document.addEventListener('DOMContentLoaded', async () => {
             setupPerformanceMonitoring();
             setupMemoryOptimization();
+            
+            // 調試：列出所有 LocalStorage 內容
+            console.log('🗂️ 頁面載入時的 LocalStorage 內容:');
+            if (localStorage.length === 0) {
+                console.log('  ⚠️ LocalStorage 完全空白');
+            } else {
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    const value = localStorage.getItem(key);
+                    if (key.startsWith('sps_')) {
+                        console.log(`  🔑 ${key}: ${value.substring(0, 100)}${value.length > 100 ? '...' : ''}`);
+                    }
+                }
+            }
             
             // 初始化時預載入關鍵資源
             if (window.resourceOptimizer) {
                 window.resourceOptimizer.preloadCriticalResources();
+            }
+            
+            // 檢查是否為 Google Sites 環境，如果是則跳過 Supabase session 檢查
+            if (loginSessionManager.isGoogleSites) {
+                console.log('🌐 [頁面載入] Google Sites 環境，跳過 Supabase session 檢查，直接檢查自動登入');
+                try {
+                    updateState({ loading: true });
+                    const autoLoginSuccess = await loginSessionManager.checkAutoLogin();
+                    
+                    if (autoLoginSuccess) {
+                        console.log('🎉 [自動登入] 自動登入成功，直接顯示 dashboard');
+                        updateState({ 
+                            view: 'dashboard', 
+                            loading: false,
+                            error: null
+                        });
+                        showMessage('歡迎回來！已自動登入', 'success');
+                    } else {
+                        console.log('❌ [自動登入] 自動登入失敗或無令牌，顯示登入頁面');
+                        updateState({ view: 'login', loading: false });
+                    }
+                } catch (error) {
+                    console.error('❌ [自動登入] 自動登入檢查失敗:', error);
+                    updateState({ view: 'login', loading: false });
+                }
+                return; // 提早返回，不執行後續的 Supabase 邏輯
+            }
+
+            // 非 Google Sites 環境才檢查 Supabase session
+            console.log('🔍 [頁面載入] 檢查 Supabase session 狀態...');
+            
+            let session = null;
+            try {
+                console.log('📡 [頁面載入] 開始 Supabase getSession 調用...');
+                const sessionResponse = await Promise.race([
+                    supabase.auth.getSession(),
+                    new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Supabase getSession 超時')), 5000)
+                    )
+                ]);
+                session = sessionResponse.data?.session;
+                console.log('✅ [頁面載入] Supabase getSession 完成');
+            } catch (error) {
+                console.error('❌ [頁面載入] Supabase getSession 失敗:', error);
+                console.log('🔄 [頁面載入] 跳過 Supabase session 檢查，直接檢查自動登入');
+            }
+            
+            console.log('📋 [頁面載入] Supabase session 檢查結果:', {
+                hasSession: !!session,
+                sessionData: session ? {
+                    user_id: session.user?.id,
+                    email: session.user?.email,
+                    access_token: session.access_token?.substring(0, 20) + '...',
+                    expires_at: session.expires_at
+                } : null
+            });
+            
+            if (!session) {
+                // 沒有 Supabase session，嘗試自動登入
+                console.log('🔍 [自動登入] 沒有 Supabase session，檢查自動登入令牌...');
+                try {
+                    updateState({ loading: true });
+                    const autoLoginSuccess = await loginSessionManager.checkAutoLogin();
+                    
+                    if (autoLoginSuccess) {
+                        console.log('🎉 [自動登入] 自動登入成功，直接顯示 dashboard');
+                        // 不調用 loadDashboardData，直接顯示簡化的 dashboard
+                        updateState({ 
+                            view: 'dashboard', 
+                            loading: false,
+                            error: null
+                        });
+                        
+                        // 顯示歡迎訊息
+                        showMessage('歡迎回來！已自動登入', 'success');
+                    } else {
+                        console.log('❌ [自動登入] 自動登入失敗或無令牌，顯示登入頁面');
+                        updateState({ view: 'login', loading: false });
+                    }
+                } catch (error) {
+                    console.error('❌ [自動登入] 自動登入檢查失敗:', error);
+                    updateState({ view: 'login', loading: false });
+                }
+            } else {
+                console.log('✅ [頁面載入] 找到 Supabase session，使用原有邏輯');
+                console.log('🔐 [頁面載入] Session 詳情:', {
+                    user_id: session.user?.id,
+                    email: session.user?.email,
+                    role: session.user?.role || '未指定',
+                    session_valid: !!session.access_token
+                });
+                // 有 session 時讓 onAuthStateChange 處理
             }
             
             console.log('所有效能優化已啟用');
